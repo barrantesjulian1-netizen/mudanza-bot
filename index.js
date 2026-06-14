@@ -15,40 +15,21 @@ const MI_WHATSAPP = '573205832328'; // ← CAMBIA ESTE POR TU NÚMERO
 const mensajesProcesados = new Set();
 
 const SYSTEM_PROMPT = `
-Eres Julián, asesor de MudanzaFacil 🚚. Tu trabajo es recolectar datos, NO calcular precios.
+Eres Julián, asesor de MudanzaFacil 🚚. 
 
-Si el cliente ya dio todos los datos en un solo mensaje, NO vuelvas a preguntar. Solo responde CALCULAR_PRECIO.
+Si el cliente ya dio todos los datos en su mensaje, responde EXACTO: CALCULAR_PRECIO
+Si falta algo, pregunta SOLO lo que falta.
 
 Datos necesarios:
 1. Dirección de cargue
-2. Dirección de descargue
-3. Piso de cargue y si tiene ascensor
-4. Piso de descargue y si tiene ascensor 
-5. Tamaño de camión: PEQUEÑO, MEDIANO, GRANDE
+2. Dirección de descargue 
+3. Piso de cargue + si tiene ascensor
+4. Piso de descargue + si tiene ascensor
+5. Camión: PEQUEÑO, MEDIANO, GRANDE
 6. Cuántos ayudantes
-7. Fecha del servicio
+7. Fecha
 
-REGLAS:
-- Si hay ascensor funcionando = NO se cobra ese piso
-- Si NO hay ascensor = $10,000 por cada piso desde el 2
-- Si ya tienes TODOS los 7 datos, responde EXACTO: CALCULAR_PRECIO
-- Si falta algo, pregunta SOLO lo que falta
-
-FLUJO DE AGENDAMIENTO:
-- Después de dar el VALOR TOTAL, pregunta: "¿Deseas agendar el servicio?"
-- Si dice SÍ: responde EXACTO:
-
-🚚 Para agendar tu servicio es importante:
-
-🏡 Dirección de recogida
-📍 Barrio
-🗒️ Nombre completo
-📲 Número de contacto
-☎️ Numero opcional
-📆 Fecha de servicio
-
-- Cuando el cliente te mande esos 6 datos, responde EXACTO así:
-  AGENDADO|direccion|barrio|nombre|contacto|opcional|fecha
+Cuando tengas todo y vayas a agendar, responde: AGENDADO|direccion|barrio|nombre|contacto|opcional|fecha
 `;
 
 const MENSAJE_BIENVENIDA = `Bienvenid@
@@ -58,15 +39,15 @@ Gracias por comunicarte con *MudanzaFacil*.🚚
 
 *Solo cubrimos Bogotá*
 
-✳️ para hacer más fácil tu cotización envíame la siguiente información:
+✳️ Envíame estos datos:
 
 ✅ Dirección de cargue
 ✅ Dirección de descargue
 ✅ De qué piso a qué piso va
 ✅ ¿Hay ascensor en cargue y descargue?
-✅ Necesitas camión: PEQUEÑO 🛻 MEDIANO 🚚 GRANDE 🚛🚛
-✅ Necesitas ayudantes que te ayuden con el cargue y descargue
-✅ Para que fecha requiere el servicio`;
+✅ Camión: PEQUEÑO 🛻 MEDIANO 🚚 GRANDE 🚛🚛
+✅ Necesitas ayudantes
+✅ Fecha del servicio`;
 
 const PRECIOS = {
   PEQUEÑO: 120000,
@@ -152,49 +133,48 @@ Llamar YA para confirmar ✅`;
   await enviarMensajeZAPI(MI_WHATSAPP, mensaje);
 }
 
-// FUNCIÓN NUEVA - Entiende lenguaje natural
-function extraerDatosParaCotizar(historial) {
-  const textoCompleto = historial.map(h => h.content).join('\n');
-  console.log('TEXTO A ANALIZAR:', textoCompleto);
-
-  // Direcciones: toma las primeras 2 líneas que parezcan direcciones
-  const lineas = textoCompleto.split('\n').filter(l => l.trim().length > 5);
-  const cargue = lineas[0]?.replace(/^\d+\.\s*/, '').trim() || '';
-  const descargue = lineas[1]?.replace(/^\d+\.\s*/, '').trim() || '';
-
-  // Entiende "Va de un 12 por ascensor a un 3 por escalera"
-  const pisoRegex = /(\d+).*?(ascensor|elevador|escalera|sin ascensor).*?(\d+).*?(ascensor|elevador|escalera|sin ascensor)/i;
-  const matchPisos = textoCompleto.match(pisoRegex);
+// NUEVA FUNCIÓN: Usa OpenAI para extraer datos. 0% errores de regex
+async function extraerDatosConIA(historial) {
+  const mensajesUsuario = historial.filter(h => h.role === 'user');
+  const textoCompleto = mensajesUsuario.map(h => h.content).join('\n');
   
-  let pisoCargue = 1, ascensorCargue = false;
-  let pisoDescargue = 1, ascensorDescargue = false;
-  
-  if (matchPisos) {
-    pisoCargue = parseInt(matchPisos[1]);
-    ascensorCargue = /ascensor|elevador/i.test(matchPisos[2]);
-    pisoDescargue = parseInt(matchPisos[3]);
-    ascensorDescargue = /ascensor|elevador/i.test(matchPisos[4]);
-  }
+  const prompt = `
+Extrae estos datos del siguiente texto de un cliente de mudanzas. Responde SOLO en JSON:
 
-  const camionMatch = textoCompleto.match(/(PEQUEÑO|MEDIANO|GRANDE|pequeño|mediano|grande)/i)?.[1]?.toUpperCase() || 'MEDIANO';
+Texto:
+"""
+${textoCompleto}
+"""
 
-  // Entiende "Si" solo = 2 ayudantes
-  let numAyudantes = 0;
-  if (/ayudantes.*sí|sí.*ayudante|^si$/im.test(textoCompleto)) {
-    const numMatch = textoCompleto.match(/(?:sí|si)[,\s]*(\d+)/i);
-    numAyudantes = numMatch? parseInt(numMatch[1]) : 2;
-  }
+Formato JSON:
+{
+  "cargue": "dirección de cargue",
+  "descargue": "dirección de descargue", 
+  "pisoCargue": número,
+  "ascensorCargue": true/false,
+  "pisoDescargue": número,
+  "ascensorDescargue": true/false,
+  "camion": "PEQUEÑO" o "MEDIANO" o "GRANDE",
+  "numAyudantes": número,
+  "fecha": "texto de la fecha"
+}
 
-  const fecha = textoCompleto.match(/(?:para el|fecha:?)\s*(\d{1,2}.*?de.*?(?:mes|enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre))/i)?.[1]?.trim() || 
-                textoCompleto.match(/(\d{1,2}.*?de.*?mes)/i)?.[1]?.trim() || '';
+Reglas:
+- Si dice "Si" solo en ayudantes, pon 2
+- Si dice "por ascensor", ascensor=true. Si dice "por escalera", ascensor=false
+- Si no especifica piso, pon 1
+- Si no especifica ayudantes, pon 0
+`;
 
-  const datos = {
-    cargue, descargue, pisoCargue, ascensorCargue, 
-    pisoDescargue, ascensorDescargue, camion: camionMatch, 
-    numAyudantes, fecha
-  };
-  
-  console.log('DATOS EXTRAÍDOS:', datos);
+  const completion = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [{ role: 'user', content: prompt }],
+    temperature: 0,
+    response_format: { type: "json_object" }
+  });
+
+  const datos = JSON.parse(completion.choices[0].message.content);
+  console.log('DATOS EXTRAÍDOS POR IA:', datos);
   return datos;
 }
 
@@ -234,7 +214,7 @@ app.post('/webhook', async (req, res) => {
     console.log(`[${numero}] OpenAI: ${respuesta}`);
 
     if (respuesta.includes('CALCULAR_PRECIO')) {
-      const datos = extraerDatosParaCotizar(historial);
+      const datos = await extraerDatosConIA(historial); // <-- AHORA USA IA, NO REGEX
       const calculo = calcularCotizacion(datos);
       const cotizacionFinal = formatearCotizacion(datos, calculo);
 
@@ -261,7 +241,7 @@ app.post('/webhook', async (req, res) => {
         contacto: contacto.trim(),
         opcional: opcional.trim(),
         fechaServicio: fecha.trim(),
-      ...datosCotizacion
+     ...datosCotizacion
       });
 
       historial.push({ role: 'assistant', content: respuesta });
