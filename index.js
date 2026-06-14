@@ -1,110 +1,274 @@
 const express = require('express');
 const axios = require('axios');
-const { OpenAI } = require('openai');
+const OpenAI = require('openai');
+// require('dotenv').config(); // En Render no se necesita, usa las env vars
 
 const app = express();
 app.use(express.json());
 
-// Variables de entorno que pusiste en Render
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const ZAPI_INSTANCE_ID = process.env.ZAPI_INSTANCE_ID;
-const ZAPI_TOKEN = process.env.ZAPI_TOKEN;
-const ZAPI_CLIENT_TOKEN = process.env.ZAPI_CLIENT_TOKEN;
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
-// Guarda mensajes ya procesados para evitar duplicados
+const conversaciones = new Map();
+const cotizaciones = new Map();
+const MI_WHATSAPP = '573205832328'; // ← CAMBIA ESTE POR TU NÚMERO
+
+// FIX ANTI-LOOP: Guarda IDs de mensajes ya procesados
 const mensajesProcesados = new Set();
-// Guarda historial por número para que el bot tenga contexto
-const conversaciones = {};
+
+const SYSTEM_PROMPT = `
+Eres Julián, asesor de MudanzaFacil 🚚. Tu trabajo es recolectar datos, NO calcular precios.
+
+OBJETIVO: Preguntar estos 6 datos:
+1. Dirección de cargue - solo Bogotá
+2. Dirección de descargue - solo Bogotá
+3. PISO DE CARGUE: Pregunta "¿En qué piso queda el cargue? Si es primer piso pon 1"
+4. PISO DE DESCARGUE: Pregunta "¿En qué piso queda el descargue? Si es primer piso pon 1"
+5. Tamaño de camión: PEQUEÑO 🛻, MEDIANO 🚚, GRANDE 🚛🚛
+6. Ayudantes: Pregunta "¿Necesitas ayudantes? Si sí, ¿cuántos? Si no sabes, cotizamos 2"
+7. Fecha del servicio
+
+IMPORTANTE:
+- NO preguntes si hay ascensor. Ya no lo usamos para el precio.
+- NUNCA calcules tú el precio
+- Cuando tengas los 6 datos, responde EXACTO: CALCULAR_PRECIO
+
+FLUJO DE AGENDAMIENTO:
+- Después de dar el VALOR TOTAL, pregunta: "¿Deseas agendar el servicio?"
+- Si dice SÍ: responde EXACTO este mensaje:
+
+🚚 Para agendar tu servicio es importante:
+
+🏡 Dirección de recogida
+📍 Barrio
+🗒️ Nombre completo
+📲 Número de contacto
+☎️ Numero opcional
+📆 Fecha de servicio
+
+- Cuando el cliente te mande esos 6 datos, responde EXACTO así en una sola línea:
+  AGENDADO|direccion|barrio|nombre|contacto|opcional|fecha
+`;
+
+const MENSAJE_BIENVENIDA = `Bienvenid@
+Gracias por comunicarte con *MudanzaFacil*.🚚
+
+🙋🏻 Mi nombre es Julián y te estaré acompañando en tu cotización
+
+*Solo cubrimos Bogotá*
+
+✳️ para hacer más fácil tu cotización envíame la siguiente información:
+
+✅ Dirección de cargue
+✅ Dirección de descargue
+✅ De qué piso a qué piso va
+✅ Necesitas camión: PEQUEÑO 🛻 MEDIANO 🚚 GRANDE 🚛🚛
+✅ Necesitas ayudantes que te ayuden con el cargue y descargue
+✅ Para que fecha requiere el servicio`;
+
+const PRECIOS = {
+  PEQUEÑO: 120000,
+  MEDIANO: 220000,
+  GRANDE: 320000,
+  AYUDANTE: 60000,
+  PISO: 10000
+};
+
+// 👇 REGLA SIMPLIFICADA: Piso 1 = $0, Piso 2+ = $10,000 cada uno
+function calcularPrecioPisos(pisoCargue, pisoDescargue) {
+  let totalPisos = 0;
+
+  if (pisoCargue > 1) {
+    totalPisos += (pisoCargue - 1);
+  }
+
+  if (pisoDescargue > 1) {
+    totalPisos += (pisoDescargue - 1);
+  }
+
+  return totalPisos * PRECIOS.PISO;
+}
+
+function calcularCotizacion(datos) {
+  const precioCamion = PRECIOS[datos.camion.toUpperCase()] || 0;
+  const precioAyudantes = datos.numAyudantes * PRECIOS.AYUDANTE;
+  const precioPisos = calcularPrecioPisos(datos.pisoCargue, datos.pisoDescargue);
+  const total = precioCamion + precioAyudantes + precioPisos;
+
+  return {
+    total,
+    detallePisos: `De piso ${datos.pisoCargue} a piso ${datos.pisoDescargue}`,
+    precioCamion,
+    precioAyudantes,
+    precioPisos
+  };
+}
+
+function formatearCotizacion(datos, calculo) {
+  return `*COTIZACIÓN MUDANZAFACIL* 🚚
+
+📍 *Ruta:* ${datos.cargue} → ${datos.descargue} - Bogotá
+🏠 *Pisos:* ${calculo.detallePisos}
+🚛 *Camión:* ${datos.camion.toUpperCase()} ${datos.camion === 'PEQUEÑO'? '🛻' : datos.camion === 'MEDIANO'? '🚚' : '🚛🚛'}
+👷 *Ayudantes:* ${datos.numAyudantes === 0? 'No' : `Sí - ${datos.numAyudantes}`}
+📅 *Fecha:* ${datos.fecha}
+
+*VALOR TOTAL: $${calculo.total.toLocaleString('es-CO')} COP*
+
+*Incluye: Transporte y cargue/descargue*
+
+Si desea, podemos dejar su servicio programado de una vez🚛`;
+}
+
+async function enviarMensajeZAPI(numero, mensaje) {
+  const url = `https://api.z-api.io/instances/${process.env.ZAPI_INSTANCE_ID}/token/${process.env.ZAPI_TOKEN}/send-text`;
+  await axios.post(url, { phone: numero, message: mensaje }, {
+    headers: { 'Client-Token': process.env.ZAPI_CLIENT_TOKEN }
+  });
+}
+
+async function notificarAgendamiento(numeroCliente, datos) {
+  const mensaje = `🔔 *NUEVO AGENDAMIENTO* 🔔
+
+*Cliente WhatsApp:* ${numeroCliente}
+
+*DATOS DE RECOGIDA:*
+🏡 Dirección: ${datos.direccion}
+📍 Barrio: ${datos.barrio}
+📆 Fecha: ${datos.fechaServicio}
+
+*CONTACTO:*
+🗒️ Nombre: ${datos.nombre}
+📲 Tel: ${datos.contacto}
+☎️ Opcional: ${datos.opcional || 'No dio'}
+
+*SERVICIO COTIZADO:*
+📍 ${datos.cargue} → ${datos.descargue}
+🏠 ${datos.pisos}
+🚛 ${datos.camion}
+👷 ${datos.ayudantes}
+💰 *TOTAL: $${datos.total} COP*
+
+Llamar YA para confirmar ✅`;
+
+  await enviarMensajeZAPI(MI_WHATSAPP, mensaje);
+}
+
+function extraerDatosParaCotizar(historial) {
+  const textoCompleto = historial.map(h => h.content).join('\n');
+
+  const cargue = textoCompleto.match(/cargue[:\s]*([^\n]+)/i)?.[1]?.trim() || '';
+  const descargue = textoCompleto.match(/descargue[:\s]*([^\n]+)/i)?.[1]?.trim() || '';
+
+  const pisoCargue = parseInt(textoCompleto.match(/piso.*cargue.*?(\d+)/i)?.[1]) || 1;
+  const pisoDescargue = parseInt(textoCompleto.match(/piso.*descargue.*?(\d+)/i)?.[1]) || 1;
+
+  const camionMatch = textoCompleto.match(/(PEQUEÑO|MEDIANO|GRANDE)/i)?.[1]?.toUpperCase() || 'MEDIANO';
+
+  let numAyudantes = 0;
+  if (textoCompleto.match(/(\d+)\s*ayudante/i)) {
+    numAyudantes = parseInt(textoCompleto.match(/(\d+)\s*ayudante/i)[1]);
+  } else if (textoCompleto.match(/ayudantes.*sí/i) || textoCompleto.match(/sí.*ayudante/i)) {
+    numAyudantes = 2;
+  }
+
+  const fecha = textoCompleto.match(/fecha[:\s]*([^\n]+)/i)?.[1]?.trim() || '';
+
+  return {
+    cargue, descargue, pisoCargue, pisoDescargue,
+    camion: camionMatch, numAyudantes, fecha
+  };
+}
 
 app.post('/webhook', async (req, res) => {
-  // 1. RESPONDE 200 INMEDIATO: así Z-API no reintenta y corta el spam
+  // 1. RESPONDE 200 INMEDIATO - ESTO CORTA EL LOOP DE Z-API
   res.sendStatus(200);
 
   try {
-    const body = req.body;
+    const { phone, text, fromMe, isGroup, messageId } = req.body;
+    if (!phone ||!text?.message) return;
 
-    // 2. FILTROS ANTI-LOOP
-    if (body.isGroup || body.fromMe ||!body.text?.message) {
-      return;
-    }
+    // 2. FILTROS ANTI-LOOP - IGNORA GRUPOS Y MENSAJES PROPIOS
+    if (fromMe || isGroup) return;
 
-    const telefono = body.phone;
-    const mensaje = body.text.message;
-    const messageId = body.messageId;
-
-    // 3. ANTI-DUPLICADOS: si Z-API reenvía el mismo msg, lo ignoramos
-    if (mensajesProcesados.has(messageId)) {
-      console.log('Duplicado ignorado:', messageId);
-      return;
-    }
+    // 3. ANTI-DUPLICADOS - SI Z-API REENVÍA, LO IGNORAMOS
+    if (mensajesProcesados.has(messageId)) return;
     mensajesProcesados.add(messageId);
-    
-    // Limpia cache cada 200 msgs para no saturar memoria
-    if (mensajesProcesados.size > 200) {
-      mensajesProcesados.clear();
+    if (mensajesProcesados.size > 200) mensajesProcesados.clear();
+
+    const numero = phone;
+    const mensajeUsuario = text.message;
+
+    if (!conversaciones.has(numero)) {
+      conversaciones.set(numero, [{ role: 'system', content: SYSTEM_PROMPT }]);
+      await enviarMensajeZAPI(numero, MENSAJE_BIENVENIDA);
+      return;
     }
 
-    console.log(`[${telefono}] Cliente: ${mensaje}`);
+    const historial = conversaciones.get(numero);
+    historial.push({ role: 'user', content: mensajeUsuario });
 
-    // 4. INICIA O CONTINÚA LA CONVERSACIÓN
-    if (!conversaciones[telefono]) {
-      conversaciones[telefono] = [];
-    }
-    conversaciones[telefono].push({ role: "user", content: mensaje });
-
-    // Solo guarda últimos 8 mensajes para no gastar tokens de más
-    if (conversaciones[telefono].length > 8) {
-      conversaciones[telefono] = conversaciones[telefono].slice(-8);
-    }
-
-    // 5. PROMPT DEL BOT - Aquí defines la personalidad
-    const sistema = {
-      role: "system",
-      content: `Eres "Mudis", asistente de Mudanzas Rápidas Colombia. 
-      Tu trabajo: cotizar mudanzas por WhatsApp.
-      REGLAS:
-      1. Sé breve, amable y usa 1 emoji máx por mensaje. Tutea.
-      2. Para cotizar necesitas: origen, destino, fecha aprox, #habitaciones, ¿hay ascensor?
-      3. Si ya tienes los datos, da un rango estimado en COP.
-      4. Precios base Bogotá: Apto 1 hab $350.000-$500.000. Cada hab extra +$150.000. 
-         Otras ciudades principales +30%. Fines de semana +20%.
-      5. Si preguntan algo raro, di que un asesor los contactará.
-      6. Nunca inventes fechas ni prometas hora exacta.`
-    };
-
-    // 6. LLAMA A OPENAI CON HISTORIAL
     const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [sistema,...conversaciones[telefono]],
-      max_tokens: 200,
-      temperature: 0.7
+      model: 'gpt-4o-mini',
+      messages: historial,
+      temperature: 0.1,
+      max_tokens: 500
     });
 
     const respuesta = completion.choices[0].message.content;
-    conversaciones[telefono].push({ role: "assistant", content: respuesta });
-    console.log(`[${telefono}] Bot: ${respuesta}`);
 
-    // 7. ENVÍA RESPUESTA POR Z-API
-    await axios.post(
-      `https://api.z-api.io/instances/${ZAPI_INSTANCE_ID}/token/${ZAPI_TOKEN}/send-text`,
-      {
-        phone: telefono,
-        message: respuesta
-      },
-      {
-        headers: { 'Client-Token': ZAPI_CLIENT_TOKEN }
-      }
-    );
+    if (respuesta.includes('CALCULAR_PRECIO')) {
+      const datos = extraerDatosParaCotizar(historial);
+      const calculo = calcularCotizacion(datos);
+      const cotizacionFinal = formatearCotizacion(datos, calculo);
+
+      cotizaciones.set(numero, {
+        cargue: datos.cargue,
+        descargue: datos.descargue,
+        pisos: calculo.detallePisos,
+        camion: datos.camion,
+        ayudantes: datos.numAyudantes === 0? 'No' : `Sí - ${datos.numAyudantes}`,
+        total: calculo.total.toLocaleString('es-CO')
+      });
+
+      historial.push({ role: 'assistant', content: cotizacionFinal });
+      await enviarMensajeZAPI(numero, cotizacionFinal);
+
+    } else if (respuesta.startsWith('AGENDADO|')) {
+      const [, direccion, barrio, nombre, contacto, opcional, fecha] = respuesta.split('|');
+      const datosCotizacion = cotizaciones.get(numero) || {};
+
+      await notificarAgendamiento(numero, {
+        direccion: direccion.trim(),
+        barrio: barrio.trim(),
+        nombre: nombre.trim(),
+        contacto: contacto.trim(),
+        opcional: opcional.trim(),
+        fechaServicio: fecha.trim(),
+   ...datosCotizacion
+      });
+
+      historial.push({ role: 'assistant', content: respuesta });
+      await enviarMensajeZAPI(numero, `¡Listo ${nombre.trim()}! Ya apartamos tu servicio para el ${fecha.trim()}. Un asesor te llamará en menos de 10 min para confirmar 🚚`);
+    } else {
+      historial.push({ role: 'assistant', content: respuesta });
+      await enviarMensajeZAPI(numero, respuesta);
+    }
+
+    if (historial.length > 21) {
+      conversaciones.set(numero, [historial[0],...historial.slice(-20)]);
+    }
 
   } catch (error) {
-    console.error('Error en webhook:', error.response?.data || error.message);
+    console.error('Error:', error.response?.data || error.message);
   }
 });
 
-// Ruta para probar que Render está vivo
 app.get('/', (req, res) => {
-  res.send('Bot Mudis activo ✅');
+  res.send('Bot MudanzaFacil funcionando ✅');
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor corriendo en puerto ${PORT}`));
+app.listen(process.env.PORT || 3000, () => {
+  console.log(`Servidor corriendo en puerto ${process.env.PORT || 3000}`);
+});
