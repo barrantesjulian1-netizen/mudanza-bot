@@ -12,31 +12,31 @@ const openai = new OpenAI({
 const conversaciones = new Map();
 const cotizaciones = new Map();
 const MI_WHATSAPP = '573205832328'; // ← CAMBIA ESTE POR TU NÚMERO
-
 const mensajesProcesados = new Set();
 
 const SYSTEM_PROMPT = `
 Eres Julián, asesor de MudanzaFacil 🚚. Tu trabajo es recolectar datos, NO calcular precios.
 
-OBJETIVO: Preguntar estos datos:
-1. Dirección de cargue - solo Bogotá
-2. Dirección de descargue - solo Bogotá 
-3. PISO DE CARGUE: "¿En qué piso queda el cargue? Si es primer piso pon 1"
-4. ASCENSOR EN CARGUE: "¿El edificio de cargue tiene ascensor funcionando? Sí/No"
-5. PISO DE DESCARGUE: "¿En qué piso queda el descargue? Si es primer piso pon 1"
-6. ASCENSOR EN DESCARGUE: "¿El edificio de descargue tiene ascensor funcionando? Sí/No"
-7. Tamaño de camión: PEQUEÑO 🛻, MEDIANO 🚚, GRANDE 🚛🚛
-8. Ayudantes: "¿Necesitas ayudantes? Si sí, ¿cuántos? Si no sabes, cotizamos 2"
-9. Fecha del servicio
+Si el cliente ya dio todos los datos en un solo mensaje, NO vuelvas a preguntar. Solo responde CALCULAR_PRECIO.
 
-IMPORTANTE:
-- Si hay ascensor funcionando en un piso, ese piso NO se cobra
-- NUNCA calcules tú el precio
-- Cuando tengas los 8 datos, responde EXACTO: CALCULAR_PRECIO
+Datos necesarios:
+1. Dirección de cargue
+2. Dirección de descargue
+3. Piso de cargue y si tiene ascensor
+4. Piso de descargue y si tiene ascensor 
+5. Tamaño de camión: PEQUEÑO, MEDIANO, GRANDE
+6. Cuántos ayudantes
+7. Fecha del servicio
+
+REGLAS:
+- Si hay ascensor funcionando = NO se cobra ese piso
+- Si NO hay ascensor = $10,000 por cada piso desde el 2
+- Si ya tienes TODOS los 7 datos, responde EXACTO: CALCULAR_PRECIO
+- Si falta algo, pregunta SOLO lo que falta
 
 FLUJO DE AGENDAMIENTO:
 - Después de dar el VALOR TOTAL, pregunta: "¿Deseas agendar el servicio?"
-- Si dice SÍ: responde EXACTO este mensaje:
+- Si dice SÍ: responde EXACTO:
 
 🚚 Para agendar tu servicio es importante:
 
@@ -47,7 +47,7 @@ FLUJO DE AGENDAMIENTO:
 ☎️ Numero opcional
 📆 Fecha de servicio
 
-- Cuando el cliente te mande esos 6 datos, responde EXACTO así en una sola línea:
+- Cuando el cliente te mande esos 6 datos, responde EXACTO así:
   AGENDADO|direccion|barrio|nombre|contacto|opcional|fecha
 `;
 
@@ -76,19 +76,10 @@ const PRECIOS = {
   PISO: 10000
 };
 
-// 👇 REGLA NUEVA: Si hay ascensor = $0, si NO hay = $10,000 por piso desde el 2
 function calcularPrecioPisos(pisoCargue, ascensorCargue, pisoDescargue, ascensorDescargue) {
   let totalPisos = 0;
-
-  // Solo cobra si NO hay ascensor y es piso 2+
-  if (!ascensorCargue && pisoCargue > 1) {
-    totalPisos += (pisoCargue - 1);
-  }
-
-  if (!ascensorDescargue && pisoDescargue > 1) {
-    totalPisos += (pisoDescargue - 1);
-  }
-
+  if (!ascensorCargue && pisoCargue > 1) totalPisos += (pisoCargue - 1);
+  if (!ascensorDescargue && pisoDescargue > 1) totalPisos += (pisoDescargue - 1);
   return totalPisos * PRECIOS.PISO;
 }
 
@@ -96,10 +87,8 @@ function calcularCotizacion(datos) {
   const precioCamion = PRECIOS[datos.camion.toUpperCase()] || 0;
   const precioAyudantes = datos.numAyudantes * PRECIOS.AYUDANTE;
   const precioPisos = calcularPrecioPisos(
-    datos.pisoCargue, 
-    datos.ascensorCargue, 
-    datos.pisoDescargue, 
-    datos.ascensorDescargue
+    datos.pisoCargue, datos.ascensorCargue, 
+    datos.pisoDescargue, datos.ascensorDescargue
   );
   const total = precioCamion + precioAyudantes + precioPisos;
 
@@ -109,9 +98,7 @@ function calcularCotizacion(datos) {
   return {
     total,
     detallePisos: `${detalleCargue} → ${detalleDescargue}`,
-    precioCamion,
-    precioAyudantes,
-    precioPisos
+    precioCamion, precioAyudantes, precioPisos
   };
 }
 
@@ -165,38 +152,50 @@ Llamar YA para confirmar ✅`;
   await enviarMensajeZAPI(MI_WHATSAPP, mensaje);
 }
 
-// FUNCIÓN ACTUALIZADA - Ahora lee también si hay ascensor
+// FUNCIÓN NUEVA - Entiende lenguaje natural
 function extraerDatosParaCotizar(historial) {
   const textoCompleto = historial.map(h => h.content).join('\n');
+  console.log('TEXTO A ANALIZAR:', textoCompleto);
 
-  const cargue = textoCompleto.match(/(?:1\.\s*Dirección de cargue:|cargue:)\s*([^\n]+)/i)?.[1]?.trim() || '';
-  const descargue = textoCompleto.match(/(?:2\.\s*Dirección de descargue:|descargue:)\s*([^\n]+)/i)?.[1]?.trim() || '';
+  // Direcciones: toma las primeras 2 líneas que parezcan direcciones
+  const lineas = textoCompleto.split('\n').filter(l => l.trim().length > 5);
+  const cargue = lineas[0]?.replace(/^\d+\.\s*/, '').trim() || '';
+  const descargue = lineas[1]?.replace(/^\d+\.\s*/, '').trim() || '';
 
-  const pisoCargue = parseInt(textoCompleto.match(/(?:3\.\s*PISO DE CARGUE:|piso.*cargue).*?(\d+)/i)?.[1]) || 1;
-  const ascensorCargue = /ascensor.*cargue.*?(sí|si)/i.test(textoCompleto);
+  // Entiende "Va de un 12 por ascensor a un 3 por escalera"
+  const pisoRegex = /(\d+).*?(ascensor|elevador|escalera|sin ascensor).*?(\d+).*?(ascensor|elevador|escalera|sin ascensor)/i;
+  const matchPisos = textoCompleto.match(pisoRegex);
   
-  const pisoDescargue = parseInt(textoCompleto.match(/(?:5\.\s*PISO DE DESCARGUE:|piso.*descargue).*?(\d+)/i)?.[1]) || 1;
-  const ascensorDescargue = /ascensor.*descargue.*?(sí|si)/i.test(textoCompleto);
-
-  const camionMatch = textoCompleto.match(/(?:7\.\s*Tamaño de camión:|camión:).*?(PEQUEÑO|MEDIANO|GRANDE)/i)?.[1]?.toUpperCase() || 'MEDIANO';
-
-  let numAyudantes = 0;
-  const ayudantesMatch = textoCompleto.match(/(?:8\.\s*Ayudantes:.*?)?(?:sí|si)[,\s]*(\d+)/i);
-  if (ayudantesMatch) {
-    numAyudantes = parseInt(ayudantesMatch[1]);
-  } else if (textoCompleto.match(/(\d+)\s*ayudante/i)) {
-    numAyudantes = parseInt(textoCompleto.match(/(\d+)\s*ayudante/i)[1]);
-  } else if (textoCompleto.match(/ayudantes.*sí/i) || textoCompleto.match(/sí.*ayudante/i)) {
-    numAyudantes = 2;
+  let pisoCargue = 1, ascensorCargue = false;
+  let pisoDescargue = 1, ascensorDescargue = false;
+  
+  if (matchPisos) {
+    pisoCargue = parseInt(matchPisos[1]);
+    ascensorCargue = /ascensor|elevador/i.test(matchPisos[2]);
+    pisoDescargue = parseInt(matchPisos[3]);
+    ascensorDescargue = /ascensor|elevador/i.test(matchPisos[4]);
   }
 
-  const fecha = textoCompleto.match(/(?:9\.\s*Fecha del servicio:|fecha:)\s*([^\n]+)/i)?.[1]?.trim() || '';
+  const camionMatch = textoCompleto.match(/(PEQUEÑO|MEDIANO|GRANDE|pequeño|mediano|grande)/i)?.[1]?.toUpperCase() || 'MEDIANO';
 
-  return {
+  // Entiende "Si" solo = 2 ayudantes
+  let numAyudantes = 0;
+  if (/ayudantes.*sí|sí.*ayudante|^si$/im.test(textoCompleto)) {
+    const numMatch = textoCompleto.match(/(?:sí|si)[,\s]*(\d+)/i);
+    numAyudantes = numMatch? parseInt(numMatch[1]) : 2;
+  }
+
+  const fecha = textoCompleto.match(/(?:para el|fecha:?)\s*(\d{1,2}.*?de.*?(?:mes|enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre))/i)?.[1]?.trim() || 
+                textoCompleto.match(/(\d{1,2}.*?de.*?mes)/i)?.[1]?.trim() || '';
+
+  const datos = {
     cargue, descargue, pisoCargue, ascensorCargue, 
     pisoDescargue, ascensorDescargue, camion: camionMatch, 
     numAyudantes, fecha
   };
+  
+  console.log('DATOS EXTRAÍDOS:', datos);
+  return datos;
 }
 
 app.post('/webhook', async (req, res) => {
@@ -205,15 +204,15 @@ app.post('/webhook', async (req, res) => {
   try {
     const { phone, text, fromMe, isGroup, messageId } = req.body;
     if (!phone ||!text?.message) return;
-
     if (fromMe || isGroup) return;
-
     if (mensajesProcesados.has(messageId)) return;
+    
     mensajesProcesados.add(messageId);
     if (mensajesProcesados.size > 200) mensajesProcesados.clear();
 
     const numero = phone;
     const mensajeUsuario = text.message;
+    console.log(`[${numero}] Cliente: ${mensajeUsuario}`);
 
     if (!conversaciones.has(numero)) {
       conversaciones.set(numero, [{ role: 'system', content: SYSTEM_PROMPT }]);
@@ -232,6 +231,7 @@ app.post('/webhook', async (req, res) => {
     });
 
     const respuesta = completion.choices[0].message.content;
+    console.log(`[${numero}] OpenAI: ${respuesta}`);
 
     if (respuesta.includes('CALCULAR_PRECIO')) {
       const datos = extraerDatosParaCotizar(historial);
@@ -261,7 +261,7 @@ app.post('/webhook', async (req, res) => {
         contacto: contacto.trim(),
         opcional: opcional.trim(),
         fechaServicio: fecha.trim(),
- ...datosCotizacion
+      ...datosCotizacion
       });
 
       historial.push({ role: 'assistant', content: respuesta });
@@ -276,7 +276,7 @@ app.post('/webhook', async (req, res) => {
     }
 
   } catch (error) {
-    console.error('Error:', error.response?.data || error.message);
+    console.error('ERROR:', error.response?.data || error.message);
   }
 });
 
