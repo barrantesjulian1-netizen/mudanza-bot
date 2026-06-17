@@ -11,7 +11,7 @@ const openai = new OpenAI({
 
 const conversaciones = new Map();
 const cotizaciones = new Map();
-const MI_WHATSAPP = '573001234567'; // ← CAMBIA ESTE POR TU NÚMERO
+const MI_WHATSAPP = '573205832328'; // ← CAMBIA ESTE POR TU NÚMERO
 const mensajesProcesados = new Set();
 
 const SYSTEM_PROMPT = `
