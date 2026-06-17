@@ -11,25 +11,56 @@ const openai = new OpenAI({
 
 const conversaciones = new Map();
 const cotizaciones = new Map();
-const MI_WHATSAPP = '573205832328'; // ← CAMBIA ESTE POR TU NÚMERO
+const MI_WHATSAPP = '573001234567'; // ← CAMBIA ESTE POR TU NÚMERO
 const mensajesProcesados = new Set();
 
 const SYSTEM_PROMPT = `
-Eres Julián, asesor de MudanzaFacil 🚚. 
+Eres Julián, asesor de MudanzaFacil 🚚. SOLO CUBRES BOGOTÁ.
 
-Si el cliente ya dio todos los datos en su mensaje, responde EXACTO: CALCULAR_PRECIO
-Si falta algo, pregunta SOLO lo que falta.
+SERVICIOS QUE OFRECES:
+1. Transporte en camión PEQUEÑO, MEDIANO o GRANDE
+2. Cargue y descargue
+3. Ayudantes para cargar/descargar
 
-Datos necesarios:
-1. Dirección de cargue
-2. Dirección de descargue 
+SERVICIOS QUE NO OFRECES - NUNCA LOS MENCIONES:
+- Embalaje / empacado / cajas
+- Desarmado de muebles
+- Instalación / conexión de electrodomésticos
+- Guardamuebles / bodegaje
+- Mudanzas internacionales o intermunicipales
+
+REGLAS DURAS:
+1. Si alguna dirección NO es de Bogotá, responde EXACTO: "FUERA_DE_COBERTURA"
+2. Si el cliente pregunta por embalaje, desarmado o algo que NO ofreces, responde: "No manejamos ese servicio. Solo transporte, cargue y descargue con ayudantes opcionales."
+3. Si el cliente ya tiene una cotización y pide CAMBIAR algo como "con ayudantes", "camión grande", responde EXACTO: RECOTIZAR
+4. Si ya tienes los 7 datos Y ambas direcciones son Bogotá, responde EXACTO: CALCULAR_PRECIO
+5. Si el cliente repite info que ya dio, NO la pidas de nuevo. Usa lo que ya tienes.
+6. NUNCA inventes precios ni servicios adicionales
+
+Datos necesarios para cotizar:
+1. Dirección de cargue en Bogotá
+2. Dirección de descargue en Bogotá
 3. Piso de cargue + si tiene ascensor
 4. Piso de descargue + si tiene ascensor
 5. Camión: PEQUEÑO, MEDIANO, GRANDE
 6. Cuántos ayudantes
 7. Fecha
 
-Cuando tengas todo y vayas a agendar, responde: AGENDADO|direccion|barrio|nombre|contacto|opcional|fecha
+FLUJO DE AGENDAMIENTO:
+- Después de dar el VALOR TOTAL, pregunta: "¿Deseas agendar el servicio?"
+- Si dice SÍ: responde EXACTO:
+
+🚚 Para agendar tu servicio es importante:
+
+🏡 Dirección de recogida
+📍 Barrio
+🗒️ Nombre completo
+📲 Número de contacto
+☎️ Numero opcional
+📆 Fecha de servicio
+
+- Cuando el cliente te mande esos 6 datos, responde EXACTO así:
+  AGENDADO|direccion|barrio|nombre|contacto|opcional|fecha
 `;
 
 const MENSAJE_BIENVENIDA = `Bienvenid@
@@ -37,12 +68,13 @@ Gracias por comunicarte con *MudanzaFacil*.🚚
 
 🙋🏻 Mi nombre es Julián y te estaré acompañando en tu cotización
 
-*Solo cubrimos Bogotá*
+*SOLO CUBRIMOS BOGOTÁ*
+*Solo transporte, cargue y descargue*
 
 ✳️ Envíame estos datos:
 
-✅ Dirección de cargue
-✅ Dirección de descargue
+✅ Dirección de cargue en Bogotá
+✅ Dirección de descargue en Bogotá
 ✅ De qué piso a qué piso va
 ✅ ¿Hay ascensor en cargue y descargue?
 ✅ Camión: PEQUEÑO 🛻 MEDIANO 🚚 GRANDE 🚛🚛
@@ -83,8 +115,10 @@ function calcularCotizacion(datos) {
   };
 }
 
-function formatearCotizacion(datos, calculo) {
-  return `*COTIZACIÓN MUDANZAFACIL* 🚚
+function formatearCotizacion(datos, calculo, esRecotizacion = false) {
+  const titulo = esRecotizacion? '*COTIZACIÓN ACTUALIZADA MUDANZAFACIL* 🚚' : '*COTIZACIÓN MUDANZAFACIL* 🚚';
+  
+  return `${titulo}
 
 📍 *Ruta:* ${datos.cargue} → ${datos.descargue} - Bogotá
 🏠 *Pisos:* ${calculo.detallePisos}
@@ -94,7 +128,7 @@ function formatearCotizacion(datos, calculo) {
 
 *VALOR TOTAL: $${calculo.total.toLocaleString('es-CO')} COP*
 
-*Incluye: Transporte y cargue/descargue*
+*Incluye: Solo transporte y cargue/descargue*
 
 Si desea, podemos dejar su servicio programado de una vez🚛`;
 }
@@ -133,23 +167,34 @@ Llamar YA para confirmar ✅`;
   await enviarMensajeZAPI(MI_WHATSAPP, mensaje);
 }
 
-// NUEVA FUNCIÓN: Usa OpenAI para extraer datos. 0% errores de regex
-async function extraerDatosConIA(historial) {
+async function extraerDatosConIA(historial, datosAnteriores = null) {
   const mensajesUsuario = historial.filter(h => h.role === 'user');
   const textoCompleto = mensajesUsuario.map(h => h.content).join('\n');
   
-  const prompt = `
-Extrae estos datos del siguiente texto de un cliente de mudanzas. Responde SOLO en JSON:
+  let prompt = `
+Analiza este texto de un cliente de mudanzas en Bogotá. Responde SOLO en JSON:
 
 Texto:
 """
 ${textoCompleto}
 """
+`;
 
-Formato JSON:
+  if (datosAnteriores) {
+    prompt += `
+Datos anteriores de la cotización:
+${JSON.stringify(datosAnteriores, null, 2)}
+
+Actualiza SOLO los campos que el cliente mencionó en el último mensaje. Mantén el resto igual.
+`;
+  }
+
+  prompt += `
+JSON:
 {
-  "cargue": "dirección de cargue",
-  "descargue": "dirección de descargue", 
+  "cargue": "dirección completa de cargue",
+  "descargue": "dirección completa de descargue", 
+  "esBogota": true/false,
   "pisoCargue": número,
   "ascensorCargue": true/false,
   "pisoDescargue": número,
@@ -160,8 +205,10 @@ Formato JSON:
 }
 
 Reglas:
-- Si dice "Si" solo en ayudantes, pon 2
-- Si dice "por ascensor", ascensor=true. Si dice "por escalera", ascensor=false
+- esBogota = false si cargue O descargue menciona otra ciudad como Manizales, Cali, Medellín, Tuluá, Villeta, Chía, Soacha, etc.
+- Si dice "quinto piso" = 5, "segundo piso" = 2, "primer piso" = 1
+- Si dice "por ascensor" = ascensor true. Si dice "por escalera" o "sin ascensor" = false
+- Si dice "con ayudante" o solo un número como "2", actualiza numAyudantes
 - Si no especifica piso, pon 1
 - Si no especifica ayudantes, pon 0
 `;
@@ -213,8 +260,48 @@ app.post('/webhook', async (req, res) => {
     const respuesta = completion.choices[0].message.content;
     console.log(`[${numero}] OpenAI: ${respuesta}`);
 
-    if (respuesta.includes('CALCULAR_PRECIO')) {
-      const datos = await extraerDatosConIA(historial); // <-- AHORA USA IA, NO REGEX
+    if (respuesta.includes('FUERA_DE_COBERTURA')) {
+      historial.push({ role: 'assistant', content: respuesta });
+      await enviarMensajeZAPI(numero, `Lo siento, por el momento *solo cubrimos servicios dentro de Bogotá* 🚚\n\nLos precios que manejo son exclusivos para Bogotá.`);
+      
+    } else if (respuesta.includes('RECOTIZAR')) {
+      const cotizacionAnterior = cotizaciones.get(numero);
+      if (!cotizacionAnterior) {
+        await enviarMensajeZAPI(numero, `Primero necesito hacerte la cotización inicial. Envíame los datos de tu mudanza por favor.`);
+        return;
+      }
+      
+      const datosActualizados = await extraerDatosConIA(historial, cotizacionAnterior.datosOriginales);
+      
+      if (!datosActualizados.esBogota) {
+        await enviarMensajeZAPI(numero, `Lo siento, por el momento *solo cubrimos servicios dentro de Bogotá* 🚚`);
+        return;
+      }
+      
+      const calculo = calcularCotizacion(datosActualizados);
+      const cotizacionFinal = formatearCotizacion(datosActualizados, calculo, true);
+
+      cotizaciones.set(numero, {
+        cargue: datosActualizados.cargue,
+        descargue: datosActualizados.descargue,
+        pisos: calculo.detallePisos,
+        camion: datosActualizados.camion,
+        ayudantes: datosActualizados.numAyudantes === 0? 'No' : `Sí - ${datosActualizados.numAyudantes}`,
+        total: calculo.total.toLocaleString('es-CO'),
+        datosOriginales: datosActualizados
+      });
+
+      historial.push({ role: 'assistant', content: cotizacionFinal });
+      await enviarMensajeZAPI(numero, cotizacionFinal);
+
+    } else if (respuesta.includes('CALCULAR_PRECIO')) {
+      const datos = await extraerDatosConIA(historial);
+      
+      if (!datos.esBogota) {
+        await enviarMensajeZAPI(numero, `Lo siento, por el momento *solo cubrimos servicios dentro de Bogotá* 🚚\n\nLos precios que manejo son exclusivos para Bogotá.`);
+        return;
+      }
+      
       const calculo = calcularCotizacion(datos);
       const cotizacionFinal = formatearCotizacion(datos, calculo);
 
@@ -224,7 +311,8 @@ app.post('/webhook', async (req, res) => {
         pisos: calculo.detallePisos,
         camion: datos.camion,
         ayudantes: datos.numAyudantes === 0? 'No' : `Sí - ${datos.numAyudantes}`,
-        total: calculo.total.toLocaleString('es-CO')
+        total: calculo.total.toLocaleString('es-CO'),
+        datosOriginales: datos
       });
 
       historial.push({ role: 'assistant', content: cotizacionFinal });
@@ -241,7 +329,7 @@ app.post('/webhook', async (req, res) => {
         contacto: contacto.trim(),
         opcional: opcional.trim(),
         fechaServicio: fecha.trim(),
-     ...datosCotizacion
+    ...datosCotizacion
       });
 
       historial.push({ role: 'assistant', content: respuesta });
