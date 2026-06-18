@@ -15,7 +15,7 @@ const MI_WHATSAPP = '573205832328'; // ← CAMBIA ESTE POR TU NÚMERO
 const mensajesProcesados = new Set();
 
 const SYSTEM_PROMPT = `
-Eres Julián, asesor de MudanzaFacil 🚚. SOLO CUBRES BOGOTÁ.
+Eres Julián, asesor de MueveYA 🚚. SOLO CUBRES BOGOTÁ.
 
 SERVICIOS QUE OFRECES:
 1. Transporte en camión PEQUEÑO, MEDIANO o GRANDE
@@ -64,7 +64,7 @@ FLUJO DE AGENDAMIENTO:
 `;
 
 const MENSAJE_BIENVENIDA = `Bienvenid@
-Gracias por comunicarte con *MudanzaFacil*.🚚
+Gracias por comunicarte con *MueveYA*.🚚
 
 🙋🏻 Mi nombre es Julián y te estaré acompañando en tu cotización
 
